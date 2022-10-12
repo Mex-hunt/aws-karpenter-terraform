@@ -18,7 +18,7 @@ terraform {
 }
 
 provider "aws" {
-  region = "us-east-1"
+  region = "us-west-2"
 }
 
 locals {
@@ -39,14 +39,15 @@ module "vpc" {
   name = local.cluster_name
   cidr = "10.0.0.0/16"
 
-  azs             = ["us-east-1a", "us-east-1b", "us-east-1c"]
+  azs             = ["us-west-2a", "us-west-2b", "us-west-2c"]
   private_subnets = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
   public_subnets  = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
 
   enable_nat_gateway     = true
   single_nat_gateway     = true
   one_nat_gateway_per_az = false
-
+#The key part of this is that we need to tag the VPC subnets 
+#that we want to use for the worker nodes.
   private_subnet_tags = {
     "kubernetes.io/cluster/${local.cluster_name}" = "owned"
     # Tags subnets for Karpenter auto-discovery
@@ -102,3 +103,114 @@ module "eks" {
     "karpenter.sh/discovery" = local.cluster_name
   }
 }
+resource "aws_iam_instance_profile" "karpenter" {
+  name = "KarpenterNodeInstanceProfile-${local.cluster_name}"
+  role = module.eks.eks_managed_node_groups["initial"].iam_role_name
+}
+module "karpenter_irsa" {
+  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
+  version = "4.17.1"
+
+  role_name                          = "karpenter-controller-${local.cluster_name}"
+  attach_karpenter_controller_policy = true
+
+  karpenter_controller_cluster_id = module.eks.cluster_id
+  karpenter_controller_node_iam_role_arns = [
+    module.eks.eks_managed_node_groups["initial"].iam_role_arn
+  ]
+#IAM OIDC identity providers are entities in IAM that 
+#describe an external identity provider (IdP) service that supports t
+#he OpenID Connect (OIDC) standard, such as Google or Salesforce. 
+#You use an IAM OIDC identity provider when you want to establish trust 
+#between an OIDC-compatible IdP and your AWS account.  
+  oidc_providers = {
+    ex = {
+      provider_arn               = module.eks.oidc_provider_arn
+      namespace_service_accounts = ["karpenter:karpenter"]
+    }
+  }
+}
+provider "helm" {
+  kubernetes {
+    host                   = module.eks.cluster_endpoint
+    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      command     = "aws"
+      args        = ["eks", "get-token", "--cluster-name", local.cluster_name]
+    }
+  }
+}
+
+resource "helm_release" "karpenter" {
+  namespace        = "karpenter"
+  create_namespace = true
+
+  name       = "karpenter"
+  repository = "https://charts.karpenter.sh"
+  chart      = "karpenter"
+  version    = "v0.10.0"
+
+  set {
+    name  = "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
+    value = module.karpenter_irsa.iam_role_arn
+  }
+
+  set {
+    name  = "clusterName"
+    value = module.eks.cluster_id
+  }
+
+  set {
+    name  = "clusterEndpoint"
+    value = module.eks.cluster_endpoint
+  }
+
+  set {
+    name  = "aws.defaultInstanceProfile"
+    value = aws_iam_instance_profile.karpenter.name
+  }
+}
+provider "kubectl" {
+  apply_retry_count      = 5
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+  load_config_file       = false
+
+  exec {
+    api_version = "client.authentication.k8s.io/v1alpha1"
+    command     = "aws"
+    args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_id]
+  }
+}
+
+resource "kubectl_manifest" "karpenter_provisioner" {
+  yaml_body = <<-YAML
+  apiVersion: karpenter.sh/v1alpha5
+  kind: Provisioner
+  metadata:
+    name: default
+  spec:
+    requirements:
+      - key: karpenter.sh/capacity-type
+        operator: In
+        values: ["spot"]
+    limits:
+      resources:
+        cpu: 1000
+    provider:
+      subnetSelector:
+        karpenter.sh/discovery: ${local.cluster_name}
+      securityGroupSelector:
+        karpenter.sh/discovery: ${local.cluster_name}
+      tags:
+        karpenter.sh/discovery: ${local.cluster_name}
+    ttlSecondsAfterEmpty: 30
+  YAML
+
+  depends_on = [
+    helm_release.karpenter
+  ]
+}
+s
